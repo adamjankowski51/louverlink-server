@@ -3,11 +3,22 @@
 // Replaces the Render/Express HTTP polling API with an MQTT event-driven model.
 //
 // MQTT topic structure:
-//   louverlink/{device_id}/status   ← device publishes its state (JSON)
-//   louverlink/{device_id}/command  ← server publishes commands to device (JSON)
-//   louverlink/{device_id}/online   ← device publishes "1" on connect (LWT "0")
+//   louverlink/{device_id}/status      ← device publishes its state (JSON)
+//   louverlink/{device_id}/command     ← server publishes commands to device (JSON)
+//   louverlink/{device_id}/online      ← device publishes "1" on connect (LWT "0")
+//   louverlink/register                ← device publishes registration request (JSON)
+//   louverlink/{device_id}/credentials ← server publishes unique credentials to device (JSON, QoS2)
 //
-// HTTP API (for the app — same endpoints as before):
+// Per-device credential flow:
+//   1. New device connects with shared REGISTRATION credential (read-only, register topic only)
+//   2. Device publishes { device_id } to louverlink/register
+//   3. Server generates unique username + strong random password for the device
+//   4. Server writes credentials to /etc/mosquitto/passwd via mosquitto_passwd
+//   5. Server publishes credentials to louverlink/{device_id}/credentials (QoS2, no retain)
+//   6. Device receives credentials, stores in Preferences, reconnects with own credentials
+//   7. Shared registration credential cannot access any other topics (ACL enforced)
+//
+// HTTP API (for the app):
 //   GET  /functions/getDevices
 //   GET  /functions/getDevice/:device_id
 //   POST /functions/setTarget        { device_id, target_position_pct }
@@ -16,9 +27,12 @@
 //   POST /functions/setOta           { device_id, ota_version, ota_url }
 // ─────────────────────────────────────────────────────────────────────────────
 
-const express = require('express');
-const mqtt    = require('mqtt');
-const { Pool } = require('pg');
+const express        = require('express');
+const mqtt           = require('mqtt');
+const { Pool }       = require('pg');
+const crypto         = require('crypto');
+const { execSync }   = require('child_process');
+const fs             = require('fs');
 
 const app = express();
 app.use(express.json());
@@ -35,8 +49,82 @@ app.use((req, res, next) => {
 // ── PostgreSQL ────────────────────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: false   // local PostgreSQL, no SSL needed
+  ssl: false
 });
+
+// ── Credential helpers ────────────────────────────────────────────────────────
+const PASSWD_FILE = '/etc/mosquitto/passwd';
+
+// Generate a cryptographically strong random password
+function generatePassword(length = 32) {
+  return crypto.randomBytes(length).toString('base64url').slice(0, length);
+}
+
+// Write or update a Mosquitto credential using mosquitto_passwd
+function setMosquittoCredential(username, password) {
+  try {
+    execSync(`mosquitto_passwd -b ${PASSWD_FILE} "${username}" "${password}"`, {
+      stdio: 'pipe'
+    });
+    execSync(`chown root:mosquitto ${PASSWD_FILE} && chmod 640 ${PASSWD_FILE}`, {
+      stdio: 'pipe'
+    });
+    console.log(`[Credentials] Set Mosquitto credential for ${username}`);
+    return true;
+  } catch (err) {
+    console.error(`[Credentials] Failed to set credential for ${username}:`, err.message);
+    return false;
+  }
+}
+
+// Delete a Mosquitto credential
+function deleteMosquittoCredential(username) {
+  try {
+    execSync(`mosquitto_passwd -D ${PASSWD_FILE} "${username}"`, { stdio: 'pipe' });
+    execSync(`chown root:mosquitto ${PASSWD_FILE} && chmod 640 ${PASSWD_FILE}`, { stdio: 'pipe' });
+    console.log(`[Credentials] Deleted Mosquitto credential for ${username}`);
+  } catch (err) {
+    console.error(`[Credentials] Failed to delete credential for ${username}:`, err.message);
+  }
+}
+
+const ACL_FILE = '/etc/mosquitto/acl';
+
+// Append per-device ACL entry so device can only access its own topics
+function addDeviceAcl(mqttUsername, deviceId) {
+  try {
+    const entry = `\nuser ${mqttUsername}\ntopic readwrite louverlink/${deviceId}/#\n`;
+    fs.appendFileSync(ACL_FILE, entry, 'utf8');
+    console.log(`[ACL] Added entry for ${mqttUsername}`);
+  } catch (err) {
+    console.error(`[ACL] Failed to add entry for ${mqttUsername}:`, err.message);
+  }
+}
+
+// Remove per-device ACL entry on unclaim
+function removeDeviceAcl(mqttUsername) {
+  try {
+    if (!fs.existsSync(ACL_FILE)) return;
+    let content = fs.readFileSync(ACL_FILE, 'utf8');
+    // Remove the user block — matches "user <name>\ntopic readwrite ...\n"
+    const regex = new RegExp(`\\nuser ${mqttUsername}\\ntopic readwrite louverlink/[^\\n]+\\n`, 'g');
+    content = content.replace(regex, '');
+    fs.writeFileSync(ACL_FILE, content, 'utf8');
+    console.log(`[ACL] Removed entry for ${mqttUsername}`);
+  } catch (err) {
+    console.error(`[ACL] Failed to remove entry for ${mqttUsername}:`, err.message);
+  }
+}
+
+// Reload Mosquitto so it picks up passwd and ACL changes without full restart
+function reloadMosquitto() {
+  try {
+    execSync('systemctl kill -s HUP mosquitto.service', { stdio: 'pipe' });
+    console.log('[Credentials] Mosquitto reloaded');
+  } catch (err) {
+    console.error('[Credentials] Failed to reload Mosquitto:', err.message);
+  }
+}
 
 // ── Database init ─────────────────────────────────────────────────────────────
 async function initDb() {
@@ -63,10 +151,15 @@ async function initDb() {
       ota_url             TEXT,
       claimed             BOOLEAN DEFAULT false,
       name                TEXT,
+      mqtt_username       TEXT,
+      mqtt_password       TEXT,
       last_seen           TIMESTAMPTZ DEFAULT NOW(),
       created_at          TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // Add columns if upgrading from older schema
+  await pool.query(`ALTER TABLE devices ADD COLUMN IF NOT EXISTS mqtt_username TEXT`);
+  await pool.query(`ALTER TABLE devices ADD COLUMN IF NOT EXISTS mqtt_password TEXT`);
   console.log('[DB] Tables ready');
 }
 
@@ -82,11 +175,10 @@ function angleToPct(angle, servoMin, servoMax) {
 }
 
 // ── MQTT client ───────────────────────────────────────────────────────────────
-// Connects to local Mosquitto broker over TLS
 const mqttClient = mqtt.connect('mqtts://mqtt.scshutters.com:8883', {
   username: process.env.MQTT_USER,
   password: process.env.MQTT_PASS,
-  capath:   '/etc/ssl/certs',          // system CA bundle — trusts Let's Encrypt
+  capath:   '/etc/ssl/certs',
   rejectUnauthorized: true,
   clientId: 'louverlink-server',
   clean:    true,
@@ -95,10 +187,10 @@ const mqttClient = mqtt.connect('mqtts://mqtt.scshutters.com:8883', {
 
 mqttClient.on('connect', () => {
   console.log('[MQTT] Connected to broker');
-  // Subscribe to all device status and online topics
-  mqttClient.subscribe('louverlink/+/status', { qos: 1 });
-  mqttClient.subscribe('louverlink/+/online', { qos: 1 });
-  console.log('[MQTT] Subscribed to louverlink/+/status and louverlink/+/online');
+  mqttClient.subscribe('louverlink/+/status',  { qos: 1 });
+  mqttClient.subscribe('louverlink/+/online',  { qos: 1 });
+  mqttClient.subscribe('louverlink/register',  { qos: 1 });
+  console.log('[MQTT] Subscribed to status, online, and register topics');
 });
 
 mqttClient.on('error', (err) => {
@@ -111,9 +203,87 @@ mqttClient.on('reconnect', () => {
 
 // ── MQTT message handler ──────────────────────────────────────────────────────
 mqttClient.on('message', async (topic, payload) => {
-  const parts    = topic.split('/');   // ['louverlink', device_id, type]
+  const parts    = topic.split('/');
   const deviceId = parts[1];
   const msgType  = parts[2];
+
+  // ── Device credential registration ───────────────────────────────────────
+  // Device connects with shared registration credential and publishes here
+  // to request its own unique credentials.
+  if (topic === 'louverlink/register') {
+    let data;
+    try { data = JSON.parse(payload.toString()); } catch { return; }
+    const regDeviceId = data.device_id;
+    if (!regDeviceId) return;
+
+    console.log(`[Register] Credential request from ${regDeviceId}`);
+
+    try {
+      // Check if device already has credentials
+      const result = await pool.query(
+        'SELECT mqtt_username, mqtt_password FROM devices WHERE device_id = $1',
+        [regDeviceId]
+      );
+
+      let mqttUsername, mqttPassword;
+
+      if (result.rows[0]?.mqtt_password) {
+        // Already has credentials — resend them (device may have lost them)
+        mqttUsername = result.rows[0].mqtt_username;
+        mqttPassword = result.rows[0].mqtt_password;
+        console.log(`[Register] Resending existing credentials to ${regDeviceId}`);
+      } else {
+        // Generate new unique credentials for this device
+        mqttUsername = `device_${regDeviceId.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+        mqttPassword = generatePassword(32);
+
+        // Write to Mosquitto passwd file
+        const ok = setMosquittoCredential(mqttUsername, mqttPassword);
+        if (!ok) {
+          console.error(`[Register] Failed to write Mosquitto credential for ${regDeviceId}`);
+          return;
+        }
+
+        // Add ACL entry so device can only access its own topics
+        addDeviceAcl(mqttUsername, regDeviceId);
+
+        // Reload Mosquitto so it picks up the new credential and ACL
+        reloadMosquitto();
+
+        // Store in database
+        await pool.query(`
+          INSERT INTO devices (device_id, mqtt_username, mqtt_password, last_seen)
+          VALUES ($1, $2, $3, NOW())
+          ON CONFLICT (device_id) DO UPDATE SET
+            mqtt_username = $2,
+            mqtt_password = $3,
+            last_seen     = NOW()
+        `, [regDeviceId, mqttUsername, mqttPassword]);
+
+        console.log(`[Register] Generated credentials for ${regDeviceId}: user=${mqttUsername}`);
+      }
+
+      // Publish credentials back to device — QoS 2, NO retain
+      // QoS 2 = exactly once delivery. No retain = credentials not stored on broker.
+      const credTopic = `louverlink/${regDeviceId}/credentials`;
+      const credPayload = JSON.stringify({
+        mqtt_username: mqttUsername,
+        mqtt_password: mqttPassword,
+      });
+
+      mqttClient.publish(credTopic, credPayload, { qos: 2, retain: false }, (err) => {
+        if (err) {
+          console.error(`[Register] Failed to publish credentials to ${regDeviceId}:`, err.message);
+        } else {
+          console.log(`[Register] Credentials sent to ${regDeviceId}`);
+        }
+      });
+
+    } catch (err) {
+      console.error('[Register] Error:', err.message);
+    }
+    return;
+  }
 
   if (!deviceId || !msgType) return;
 
@@ -353,15 +523,30 @@ app.post('/functions/unclaimDevice', async (req, res) => {
   if (!device_id) return res.status(400).json({ error: 'device_id required' });
 
   try {
+    // Get existing mqtt_username before clearing
+    const result = await pool.query(
+      'SELECT mqtt_username FROM devices WHERE device_id = $1', [device_id]
+    );
+    const mqttUsername = result.rows[0]?.mqtt_username;
+
     await pool.query(`
       UPDATE devices
       SET claimed             = false,
           name                = NULL,
           target_position     = 0,
           target_position_pct = 0,
-          current_position    = -1
+          current_position    = -1,
+          mqtt_username       = NULL,
+          mqtt_password       = NULL
       WHERE device_id = $1
     `, [device_id]);
+
+    // Delete device's unique Mosquitto credential and ACL entry
+    if (mqttUsername) {
+      deleteMosquittoCredential(mqttUsername);
+      removeDeviceAcl(mqttUsername);
+      reloadMosquitto();
+    }
 
     // Clear any retained command on the broker
     mqttClient.publish(`louverlink/${device_id}/command`, '', { retain: true });
