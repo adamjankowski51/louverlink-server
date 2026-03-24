@@ -271,7 +271,7 @@ mqttClient.on('message', async (topic, payload) => {
         mqtt_password: mqttPassword,
       });
 
-      mqttClient.publish(credTopic, credPayload, { qos: 2, retain: false }, (err) => {
+      mqttClient.publish(credTopic, credPayload, { qos: 1, retain: false }, (err) => {
         if (err) {
           console.error(`[Register] Failed to publish credentials to ${regDeviceId}:`, err.message);
         } else {
