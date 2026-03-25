@@ -7,16 +7,17 @@
 //   louverlink/{device_id}/command     ← server publishes commands to device (JSON)
 //   louverlink/{device_id}/online      ← device publishes "1" on connect (LWT "0")
 //   louverlink/register                ← device publishes registration request (JSON)
-//   louverlink/{device_id}/credentials ← server publishes unique credentials to device (JSON, QoS2)
+//   louverlink/{device_id}/credentials ← server publishes unique credentials to device (JSON, QoS1, retain)
 //
 // Per-device credential flow:
 //   1. New device connects with shared REGISTRATION credential (read-only, register topic only)
 //   2. Device publishes { device_id } to louverlink/register
 //   3. Server generates unique username + strong random password for the device
 //   4. Server writes credentials to /etc/mosquitto/passwd via mosquitto_passwd
-//   5. Server publishes credentials to louverlink/{device_id}/credentials (QoS2, no retain)
-//   6. Device receives credentials, stores in Preferences, reconnects with own credentials
-//   7. Shared registration credential cannot access any other topics (ACL enforced)
+//   5. Server publishes credentials to louverlink/{device_id}/credentials (QoS1, retain)
+//   6. Mosquitto is reloaded 2s AFTER publish so the device session is not killed before delivery
+//   7. Device receives credentials, stores in Preferences, reconnects with own credentials
+//   8. Shared registration credential cannot access any other topics (ACL enforced)
 //
 // HTTP API (for the app):
 //   GET  /functions/getDevices
@@ -247,8 +248,9 @@ mqttClient.on('message', async (topic, payload) => {
         // Add ACL entry so device can only access its own topics
         addDeviceAcl(mqttUsername, regDeviceId);
 
-        // Reload Mosquitto so it picks up the new credential and ACL
-        reloadMosquitto();
+        // NOTE: Do NOT reload Mosquitto here — the HUP would kill the device's
+        // active subscription before credentials are delivered. Reload happens
+        // 2 seconds after publish confirms delivery (see publish callback below).
 
         // Store in database
         await pool.query(`
@@ -263,8 +265,10 @@ mqttClient.on('message', async (topic, payload) => {
         console.log(`[Register] Generated credentials for ${regDeviceId}: user=${mqttUsername}`);
       }
 
-      // Publish credentials back to device — QoS 2, NO retain
-      // QoS 2 = exactly once delivery. No retain = credentials not stored on broker.
+      // Publish credentials back to device — QoS 1, retain so device gets it
+      // even if it reconnects after a brief drop.
+      // IMPORTANT: Mosquitto is reloaded AFTER publish confirms delivery (2s delay)
+      // so the HUP signal does not kill the device's active subscription mid-flight.
       const credTopic = `louverlink/${regDeviceId}/credentials`;
       const credPayload = JSON.stringify({
         mqtt_username: mqttUsername,
@@ -276,6 +280,9 @@ mqttClient.on('message', async (topic, payload) => {
           console.error(`[Register] Failed to publish credentials to ${regDeviceId}:`, err.message);
         } else {
           console.log(`[Register] Credentials sent to ${regDeviceId}`);
+          // Reload Mosquitto 2s after delivery — gives device time to receive
+          // the retained message before the HUP resets active sessions.
+          setTimeout(() => reloadMosquitto(), 2000);
         }
       });
 
@@ -460,10 +467,10 @@ app.post('/functions/setTarget', async (req, res) => {
     const device = result.rows[0];
     if (!device) return res.status(404).json({ error: 'Device not found' });
 
-    const servoMin   = device.servo_angle_min ?? 0;
-    const servoMax   = device.servo_angle_max ?? 180;
+    const servoMin    = device.servo_angle_min ?? 0;
+    const servoMax    = device.servo_angle_max ?? 180;
     const targetAngle = pctToAngle(target_position_pct, servoMin, servoMax);
-    const state      = target_state ?? (target_position_pct > 50 ? 'open' : 'closed');
+    const state       = target_state ?? (target_position_pct > 50 ? 'open' : 'closed');
 
     await pool.query(`
       UPDATE devices
