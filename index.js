@@ -265,11 +265,16 @@ mqttClient.on('message', async (topic, payload) => {
         console.log(`[Register] Generated credentials for ${regDeviceId}: user=${mqttUsername}`);
       }
 
-      // Publish credentials back to device — QoS 1, retain so device gets it
-      // even if it reconnects after a brief drop.
-      // IMPORTANT: Mosquitto is reloaded AFTER publish confirms delivery (2s delay)
-      // so the HUP signal does not kill the device's active subscription mid-flight.
+      // Clear any stale retained credentials before publishing new ones.
+      // A stale retained message (from before unclaim) would be delivered to the
+      // device immediately on subscribe, causing an rc=5 auth failure loop because
+      // the password no longer matches what Mosquitto has.
+      // Wait 200ms after clearing before publishing new credentials — ensures the
+      // clear reaches the broker before the new payload so ordering is guaranteed.
       const credTopic = `louverlink/${regDeviceId}/credentials`;
+      mqttClient.publish(credTopic, '', { retain: true });  // clear stale message
+      await new Promise(resolve => setTimeout(resolve, 200));
+
       const credPayload = JSON.stringify({
         mqtt_username: mqttUsername,
         mqtt_password: mqttPassword,
@@ -555,8 +560,12 @@ app.post('/functions/unclaimDevice', async (req, res) => {
       reloadMosquitto();
     }
 
-    // Clear any retained command on the broker
-    mqttClient.publish(`louverlink/${device_id}/command`, '', { retain: true });
+    // Clear any retained messages on the broker for this device.
+    // CRITICAL: credentials topic must be cleared so the device does not receive
+    // a stale password on re-registration, which causes an rc=5 auth failure loop.
+    mqttClient.publish(`louverlink/${device_id}/credentials`, '', { retain: true });
+    mqttClient.publish(`louverlink/${device_id}/command`,     '', { retain: true });
+    console.log(`[unclaimDevice] Cleared retained broker messages for ${device_id}`);
 
     console.log(`[unclaimDevice] Unclaimed: ${device_id}`);
     res.json({ ok: true });
