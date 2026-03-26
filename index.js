@@ -164,19 +164,16 @@ function angleToPct(angle, servoMin, servoMax) {
 }
 
 // ── MQTT client ───────────────────────────────────────────────────────────────
-// protocolVersion: 4 forces MQTT v3.1.1 — mqtt.js v5 has a TLS reconnect bug
-// where it opens a second connection before closing the first, causing the broker
-// to kick the original session with "already connected / protocol error" in a loop.
-const mqttClient = mqtt.connect('mqtts://mqtt.scshutters.com:8883', {
+// Connect via localhost:1883 (no TLS) — the server runs on the same machine as
+// the broker so TLS is unnecessary and causes SNI/EOF errors when connecting
+// to the public domain name which resolves back to 127.0.0.1.
+const mqttClient = mqtt.connect('mqtt://127.0.0.1:1883', {
   username:        process.env.MQTT_USER,
   password:        process.env.MQTT_PASS,
-  capath:          '/etc/ssl/certs',
-  rejectUnauthorized: true,
   clientId:        'louverlink-server',
   clean:           true,
   reconnectPeriod: 5000,
   connectTimeout:  10000,
-  protocolVersion: 4,
 });
 
 mqttClient.on('connect', () => {
