@@ -56,20 +56,14 @@ const pool = new Pool({
 // ── Credential helpers ────────────────────────────────────────────────────────
 const PASSWD_FILE = '/etc/mosquitto/passwd';
 
-// Generate a cryptographically strong random password
 function generatePassword(length = 32) {
   return crypto.randomBytes(length).toString('base64url').slice(0, length);
 }
 
-// Write or update a Mosquitto credential using mosquitto_passwd
 function setMosquittoCredential(username, password) {
   try {
-    execSync(`mosquitto_passwd -b ${PASSWD_FILE} "${username}" "${password}"`, {
-      stdio: 'pipe'
-    });
-    execSync(`chown root:mosquitto ${PASSWD_FILE} && chmod 640 ${PASSWD_FILE}`, {
-      stdio: 'pipe'
-    });
+    execSync(`mosquitto_passwd -b ${PASSWD_FILE} "${username}" "${password}"`, { stdio: 'pipe' });
+    execSync(`chown root:mosquitto ${PASSWD_FILE} && chmod 640 ${PASSWD_FILE}`, { stdio: 'pipe' });
     console.log(`[Credentials] Set Mosquitto credential for ${username}`);
     return true;
   } catch (err) {
@@ -78,7 +72,6 @@ function setMosquittoCredential(username, password) {
   }
 }
 
-// Delete a Mosquitto credential
 function deleteMosquittoCredential(username) {
   try {
     execSync(`mosquitto_passwd -D ${PASSWD_FILE} "${username}"`, { stdio: 'pipe' });
@@ -91,7 +84,6 @@ function deleteMosquittoCredential(username) {
 
 const ACL_FILE = '/etc/mosquitto/acl';
 
-// Append per-device ACL entry so device can only access its own topics
 function addDeviceAcl(mqttUsername, deviceId) {
   try {
     const entry = `\nuser ${mqttUsername}\ntopic readwrite louverlink/${deviceId}/#\n`;
@@ -102,12 +94,10 @@ function addDeviceAcl(mqttUsername, deviceId) {
   }
 }
 
-// Remove per-device ACL entry on unclaim
 function removeDeviceAcl(mqttUsername) {
   try {
     if (!fs.existsSync(ACL_FILE)) return;
     let content = fs.readFileSync(ACL_FILE, 'utf8');
-    // Remove the user block — matches "user <name>\ntopic readwrite ...\n"
     const regex = new RegExp(`\\nuser ${mqttUsername}\\ntopic readwrite louverlink/[^\\n]+\\n`, 'g');
     content = content.replace(regex, '');
     fs.writeFileSync(ACL_FILE, content, 'utf8');
@@ -117,7 +107,6 @@ function removeDeviceAcl(mqttUsername) {
   }
 }
 
-// Reload Mosquitto so it picks up passwd and ACL changes without full restart
 function reloadMosquitto() {
   try {
     execSync('systemctl kill -s HUP mosquitto.service', { stdio: 'pipe' });
@@ -158,7 +147,6 @@ async function initDb() {
       created_at          TIMESTAMPTZ DEFAULT NOW()
     )
   `);
-  // Add columns if upgrading from older schema
   await pool.query(`ALTER TABLE devices ADD COLUMN IF NOT EXISTS mqtt_username TEXT`);
   await pool.query(`ALTER TABLE devices ADD COLUMN IF NOT EXISTS mqtt_password TEXT`);
   console.log('[DB] Tables ready');
@@ -176,14 +164,19 @@ function angleToPct(angle, servoMin, servoMax) {
 }
 
 // ── MQTT client ───────────────────────────────────────────────────────────────
+// protocolVersion: 4 forces MQTT v3.1.1 — mqtt.js v5 has a TLS reconnect bug
+// where it opens a second connection before closing the first, causing the broker
+// to kick the original session with "already connected / protocol error" in a loop.
 const mqttClient = mqtt.connect('mqtts://mqtt.scshutters.com:8883', {
-  username: process.env.MQTT_USER,
-  password: process.env.MQTT_PASS,
-  capath:   '/etc/ssl/certs',
+  username:        process.env.MQTT_USER,
+  password:        process.env.MQTT_PASS,
+  capath:          '/etc/ssl/certs',
   rejectUnauthorized: true,
-  clientId: 'louverlink-server',
-  clean:    true,
-  reconnectPeriod: 3000,
+  clientId:        'louverlink-server',
+  clean:           true,
+  reconnectPeriod: 5000,
+  connectTimeout:  10000,
+  protocolVersion: 4,
 });
 
 mqttClient.on('connect', () => {
@@ -209,8 +202,6 @@ mqttClient.on('message', async (topic, payload) => {
   const msgType  = parts[2];
 
   // ── Device credential registration ───────────────────────────────────────
-  // Device connects with shared registration credential and publishes here
-  // to request its own unique credentials.
   if (topic === 'louverlink/register') {
     let data;
     try { data = JSON.parse(payload.toString()); } catch { return; }
@@ -220,7 +211,6 @@ mqttClient.on('message', async (topic, payload) => {
     console.log(`[Register] Credential request from ${regDeviceId}`);
 
     try {
-      // Check if device already has credentials
       const result = await pool.query(
         'SELECT mqtt_username, mqtt_password FROM devices WHERE device_id = $1',
         [regDeviceId]
@@ -229,30 +219,21 @@ mqttClient.on('message', async (topic, payload) => {
       let mqttUsername, mqttPassword;
 
       if (result.rows[0]?.mqtt_password) {
-        // Already has credentials — resend them (device may have lost them)
         mqttUsername = result.rows[0].mqtt_username;
         mqttPassword = result.rows[0].mqtt_password;
         console.log(`[Register] Resending existing credentials to ${regDeviceId}`);
       } else {
-        // Generate new unique credentials for this device
         mqttUsername = `device_${regDeviceId.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
         mqttPassword = generatePassword(32);
 
-        // Write to Mosquitto passwd file
         const ok = setMosquittoCredential(mqttUsername, mqttPassword);
         if (!ok) {
           console.error(`[Register] Failed to write Mosquitto credential for ${regDeviceId}`);
           return;
         }
 
-        // Add ACL entry so device can only access its own topics
         addDeviceAcl(mqttUsername, regDeviceId);
 
-        // NOTE: Do NOT reload Mosquitto here — the HUP would kill the device's
-        // active subscription before credentials are delivered. Reload happens
-        // 2 seconds after publish confirms delivery (see publish callback below).
-
-        // Store in database
         await pool.query(`
           INSERT INTO devices (device_id, mqtt_username, mqtt_password, last_seen)
           VALUES ($1, $2, $3, NOW())
@@ -265,14 +246,8 @@ mqttClient.on('message', async (topic, payload) => {
         console.log(`[Register] Generated credentials for ${regDeviceId}: user=${mqttUsername}`);
       }
 
-      // Clear any stale retained credentials before publishing new ones.
-      // A stale retained message (from before unclaim) would be delivered to the
-      // device immediately on subscribe, causing an rc=5 auth failure loop because
-      // the password no longer matches what Mosquitto has.
-      // Wait 200ms after clearing before publishing new credentials — ensures the
-      // clear reaches the broker before the new payload so ordering is guaranteed.
       const credTopic = `louverlink/${regDeviceId}/credentials`;
-      mqttClient.publish(credTopic, '', { retain: true });  // clear stale message
+      mqttClient.publish(credTopic, '', { retain: true });
       await new Promise(resolve => setTimeout(resolve, 200));
 
       const credPayload = JSON.stringify({
@@ -285,8 +260,6 @@ mqttClient.on('message', async (topic, payload) => {
           console.error(`[Register] Failed to publish credentials to ${regDeviceId}:`, err.message);
         } else {
           console.log(`[Register] Credentials sent to ${regDeviceId}`);
-          // Reload Mosquitto 2s after delivery — gives device time to receive
-          // the retained message before the HUP resets active sessions.
           setTimeout(() => reloadMosquitto(), 2000);
         }
       });
@@ -325,24 +298,14 @@ mqttClient.on('message', async (topic, payload) => {
     }
 
     const {
-      firmware_version,
-      current_position,
-      is_moving,
-      battery_voltage,
-      battery_pct,
-      usb_powered,
-      poll_interval_ms,
-      ip,
+      firmware_version, current_position, is_moving,
+      battery_voltage, battery_pct, usb_powered, poll_interval_ms, ip,
     } = data;
 
     console.log(`[MQTT] Status from ${deviceId}: pos=${current_position} moving=${is_moving} batt=${battery_voltage}V`);
 
     try {
-      // Get current device record (for servo limits and target)
-      const result = await pool.query(
-        'SELECT * FROM devices WHERE device_id = $1',
-        [deviceId]
-      );
+      const result = await pool.query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);
       const device = result.rows[0];
 
       const servoMin = device?.servo_angle_min ?? 0;
@@ -353,7 +316,6 @@ mqttClient.on('message', async (topic, payload) => {
         currentPct = angleToPct(current_position, servoMin, servoMax);
       }
 
-      // Upsert device record
       await pool.query(`
         INSERT INTO devices (
           device_id, ip, firmware_version, current_position,
@@ -361,48 +323,35 @@ mqttClient.on('message', async (topic, payload) => {
           battery_pct, usb_powered, poll_interval_ms, last_seen
         ) VALUES ($1,$2,$3,$4,$5,$6,true,$7,$8,$9,$10,NOW())
         ON CONFLICT (device_id) DO UPDATE SET
-          ip                  = EXCLUDED.ip,
-          firmware_version    = EXCLUDED.firmware_version,
-          current_position    = EXCLUDED.current_position,
+          ip                   = EXCLUDED.ip,
+          firmware_version     = EXCLUDED.firmware_version,
+          current_position     = EXCLUDED.current_position,
           current_position_pct = $5,
-          is_moving           = EXCLUDED.is_moving,
-          is_online           = true,
-          battery_voltage     = EXCLUDED.battery_voltage,
-          battery_pct         = EXCLUDED.battery_pct,
-          usb_powered         = EXCLUDED.usb_powered,
-          poll_interval_ms    = EXCLUDED.poll_interval_ms,
-          last_seen           = NOW()
+          is_moving            = EXCLUDED.is_moving,
+          is_online            = true,
+          battery_voltage      = EXCLUDED.battery_voltage,
+          battery_pct          = EXCLUDED.battery_pct,
+          usb_powered          = EXCLUDED.usb_powered,
+          poll_interval_ms     = EXCLUDED.poll_interval_ms,
+          last_seen            = NOW()
       `, [
-        deviceId,
-        ip ?? null,
-        firmware_version ?? null,
-        current_position ?? -1,
-        currentPct,
-        is_moving ?? false,
-        battery_voltage ?? 0,
-        battery_pct ?? 0,
-        usb_powered ?? false,
+        deviceId, ip ?? null, firmware_version ?? null,
+        current_position ?? -1, currentPct, is_moving ?? false,
+        battery_voltage ?? 0, battery_pct ?? 0, usb_powered ?? false,
         poll_interval_ms ?? 30000,
       ]);
 
-      // If device is unclaimed, nothing more to do
       if (!device || !device.claimed) {
         console.log(`[MQTT] Unclaimed device: ${deviceId}`);
         return;
       }
 
-      // Send command back to device with current target and OTA info
       const targetAngle = device.target_position ?? 0;
-      const command = {
-        target_position: targetAngle,
-        status: 'ok',
-      };
+      const command = { target_position: targetAngle, status: 'ok' };
 
-      // Include OTA info if pending
       if (device.ota_version && device.ota_url) {
         command.ota_version = device.ota_version;
         command.ota_url     = device.ota_url;
-        // Clear OTA after sending
         await pool.query(
           'UPDATE devices SET ota_version = NULL, ota_url = NULL WHERE device_id = $1',
           [deviceId]
@@ -412,7 +361,7 @@ mqttClient.on('message', async (topic, payload) => {
       mqttClient.publish(
         `louverlink/${deviceId}/command`,
         JSON.stringify(command),
-        { qos: 1, retain: true }   // retain so device gets it on reconnect
+        { qos: 1, retain: true }
       );
 
       console.log(`[MQTT] Command sent to ${deviceId}: target=${targetAngle}°`);
@@ -423,11 +372,8 @@ mqttClient.on('message', async (topic, payload) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HTTP API — used by the app (same contract as the old Render API)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── HTTP API ──────────────────────────────────────────────────────────────────
 
-// ── GET /functions/getDevices ─────────────────────────────────────────────────
 app.get('/functions/getDevices', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM devices ORDER BY created_at ASC');
@@ -438,13 +384,9 @@ app.get('/functions/getDevices', async (req, res) => {
   }
 });
 
-// ── GET /functions/getDevice/:device_id ───────────────────────────────────────
 app.get('/functions/getDevice/:device_id', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT * FROM devices WHERE device_id = $1',
-      [req.params.device_id]
-    );
+    const result = await pool.query('SELECT * FROM devices WHERE device_id = $1', [req.params.device_id]);
     if (!result.rows[0]) return res.status(404).json({ error: 'Device not found' });
     res.json(result.rows[0]);
   } catch (err) {
@@ -453,22 +395,15 @@ app.get('/functions/getDevice/:device_id', async (req, res) => {
   }
 });
 
-// ── POST /functions/setTarget ─────────────────────────────────────────────────
-// App sets a new target position. Server updates DB and immediately
-// publishes command to the device topic (instant delivery vs waiting for poll).
 app.post('/functions/setTarget', async (req, res) => {
   const { device_id, target_position_pct, target_state } = req.body;
-
   if (!device_id || target_position_pct === undefined)
     return res.status(400).json({ error: 'device_id and target_position_pct required' });
-
   if (target_position_pct < 0 || target_position_pct > 100)
     return res.status(400).json({ error: 'target_position_pct must be 0-100' });
 
   try {
-    const result = await pool.query(
-      'SELECT * FROM devices WHERE device_id = $1', [device_id]
-    );
+    const result = await pool.query('SELECT * FROM devices WHERE device_id = $1', [device_id]);
     const device = result.rows[0];
     if (!device) return res.status(404).json({ error: 'Device not found' });
 
@@ -478,21 +413,13 @@ app.post('/functions/setTarget', async (req, res) => {
     const state       = target_state ?? (target_position_pct > 50 ? 'open' : 'closed');
 
     await pool.query(`
-      UPDATE devices
-      SET target_position_pct = $1,
-          target_position     = $2,
-          target_state        = $3
+      UPDATE devices SET target_position_pct = $1, target_position = $2, target_state = $3
       WHERE device_id = $4
     `, [target_position_pct, targetAngle, state, device_id]);
 
-    // Immediately push command to device via MQTT (no waiting for next poll)
-    const command = {
-      target_position: targetAngle,
-      status: 'ok',
-    };
     mqttClient.publish(
       `louverlink/${device_id}/command`,
-      JSON.stringify(command),
+      JSON.stringify({ target_position: targetAngle, status: 'ok' }),
       { qos: 1, retain: true }
     );
 
@@ -504,22 +431,15 @@ app.post('/functions/setTarget', async (req, res) => {
   }
 });
 
-// ── POST /functions/claimDevice ───────────────────────────────────────────────
 app.post('/functions/claimDevice', async (req, res) => {
   const { device_id, name, servo_angle_min, servo_angle_max, gpio_pin } = req.body;
   if (!device_id) return res.status(400).json({ error: 'device_id required' });
 
   try {
     await pool.query(`
-      UPDATE devices
-      SET name            = $1,
-          servo_angle_min = $2,
-          servo_angle_max = $3,
-          gpio_pin        = $4,
-          claimed         = true
-      WHERE device_id = $5
-    `, [name ?? device_id, servo_angle_min ?? 0, servo_angle_max ?? 180,
-        gpio_pin ?? 0, device_id]);
+      UPDATE devices SET name = $1, servo_angle_min = $2, servo_angle_max = $3,
+        gpio_pin = $4, claimed = true WHERE device_id = $5
+    `, [name ?? device_id, servo_angle_min ?? 0, servo_angle_max ?? 180, gpio_pin ?? 0, device_id]);
 
     console.log(`[claimDevice] Claimed: ${device_id} as "${name}"`);
     res.json({ ok: true });
@@ -529,44 +449,31 @@ app.post('/functions/claimDevice', async (req, res) => {
   }
 });
 
-// ── POST /functions/unclaimDevice ─────────────────────────────────────────────
 app.post('/functions/unclaimDevice', async (req, res) => {
   const { device_id } = req.body;
   if (!device_id) return res.status(400).json({ error: 'device_id required' });
 
   try {
-    // Get existing mqtt_username before clearing
     const result = await pool.query(
       'SELECT mqtt_username FROM devices WHERE device_id = $1', [device_id]
     );
     const mqttUsername = result.rows[0]?.mqtt_username;
 
     await pool.query(`
-      UPDATE devices
-      SET claimed             = false,
-          name                = NULL,
-          target_position     = 0,
-          target_position_pct = 0,
-          current_position    = -1,
-          mqtt_username       = NULL,
-          mqtt_password       = NULL
+      UPDATE devices SET claimed = false, name = NULL, target_position = 0,
+        target_position_pct = 0, current_position = -1,
+        mqtt_username = NULL, mqtt_password = NULL
       WHERE device_id = $1
     `, [device_id]);
 
-    // Delete device's unique Mosquitto credential and ACL entry
     if (mqttUsername) {
       deleteMosquittoCredential(mqttUsername);
       removeDeviceAcl(mqttUsername);
       reloadMosquitto();
     }
 
-    // Clear any retained messages on the broker for this device.
-    // CRITICAL: credentials topic must be cleared so the device does not receive
-    // a stale password on re-registration, which causes an rc=5 auth failure loop.
     mqttClient.publish(`louverlink/${device_id}/credentials`, '', { retain: true });
     mqttClient.publish(`louverlink/${device_id}/command`,     '', { retain: true });
-    console.log(`[unclaimDevice] Cleared retained broker messages for ${device_id}`);
-
     console.log(`[unclaimDevice] Unclaimed: ${device_id}`);
     res.json({ ok: true });
   } catch (err) {
@@ -575,7 +482,6 @@ app.post('/functions/unclaimDevice', async (req, res) => {
   }
 });
 
-// ── POST /functions/setOta ────────────────────────────────────────────────────
 app.post('/functions/setOta', async (req, res) => {
   const { device_id, ota_version, ota_url } = req.body;
   if (!device_id || !ota_version || !ota_url)
@@ -594,14 +500,46 @@ app.post('/functions/setOta', async (req, res) => {
   }
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    mqtt: mqttClient.connected ? 'connected' : 'disconnected',
-    uptime: process.uptime(),
-  });
+  res.json({ ok: true, mqtt: mqttClient.connected ? 'connected' : 'disconnected', uptime: process.uptime() });
 });
+
+// ── 24-hour stale device cleanup ──────────────────────────────────────────────
+async function cleanupStaleDevices() {
+  console.log('[Cleanup] Checking for stale devices...');
+  try {
+    const result = await pool.query(`
+      SELECT device_id, mqtt_username FROM devices
+      WHERE last_seen < NOW() - INTERVAL '24 hours' AND claimed = false
+    `);
+
+    if (result.rows.length === 0) {
+      console.log('[Cleanup] No stale unclaimed devices found');
+      return;
+    }
+
+    for (const device of result.rows) {
+      const { device_id, mqtt_username } = device;
+      console.log(`[Cleanup] Removing stale device: ${device_id}`);
+      if (mqtt_username) {
+        deleteMosquittoCredential(mqtt_username);
+        removeDeviceAcl(mqtt_username);
+      }
+      mqttClient.publish(`louverlink/${device_id}/credentials`, '', { retain: true });
+      mqttClient.publish(`louverlink/${device_id}/command`,     '', { retain: true });
+      await pool.query('DELETE FROM devices WHERE device_id = $1', [device_id]);
+      console.log(`[Cleanup] Removed: ${device_id}`);
+    }
+
+    if (result.rows.some(d => d.mqtt_username)) reloadMosquitto();
+    console.log(`[Cleanup] Done — removed ${result.rows.length} stale device(s)`);
+  } catch (err) {
+    console.error('[Cleanup] Error:', err.message);
+  }
+}
+
+setTimeout(cleanupStaleDevices, 30000);
+setInterval(cleanupStaleDevices, 60 * 60 * 1000);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
